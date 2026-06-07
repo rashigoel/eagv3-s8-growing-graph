@@ -73,7 +73,7 @@ formatter:
 
 sandbox_executor:
   prompt: prompts/sandbox_executor.md
-  internal_successors: [data_visualizer]
+  internal_successors: [data_visualizer, formatter]
   temperature: 0.0
   max_tokens: 400
   description: Runs code from a Coder node in the sandbox and returns stdout, stderr, exit code, and any generated files.
@@ -94,7 +94,7 @@ browser:
 data_visualizer:
   prompt: prompts/data_visualizer.md
   tools_allowed: []
-  internal_successors: [formatter]
+  internal_successors: []
   temperature: 0.1
   max_tokens: 2000
-  description: Renders structured numerical data from Coder or SandboxExecutor into a markdown comparison table, ASCII bar chart, and a Chart.js HTML page written to ~/s8_output/.
+  description: Side-car visual renderer. Reads sandbox stdout and produces a markdown table, ASCII bar chart, and Chart.js HTML page at ~/s8_output/. Runs in parallel with formatter — not in the formatter's critical path.
