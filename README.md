@@ -246,6 +246,74 @@ Interactive chart written to: `~/s8_output/visualization.html`
 
 ---
 
+## Session Run — s8-1a9c5501
+
+**Query:**
+> Compare investing $50,000 across three assets: S&P 500 (VOO ETF),
+> Gold (GLD ETF), and NIFTY 500 (Indian broad market index) over a 10-year
+> horizon. Research their 5-year CAGR, 1-year return, and annualised
+> volatility. Compute nominal value, inflation-adjusted real value (3%
+> inflation), Sharpe-like score (CAGR ÷ volatility), and risk-adjusted
+> final value. Rank by risk-adjusted final value.
+
+**7-node graph:**
+
+| Node | Skill                  | Provider | Inputs        |
+|------|------------------------|----------|---------------|
+| n:1  | planner                | gemini   | USER_QUERY    |
+| n:2  | researcher (VOO)       | gemini   | (scoped)      |
+| n:3  | researcher (GLD)       | gemini   | (scoped)      |
+| n:4  | researcher (NIFTY 500) | gemini   | (scoped)      |
+| n:5  | coder                  | gemini   | n:2, n:3, n:4 |
+| n:6  | sandbox_executor       | —        | n:5           |
+| n:7  | formatter              | gemini   | n:6           |
+
+**Coder functions (generated Python, run in sandbox):**
+
+```python
+# 1. Compound growth — nominal projected value
+nominal_value = initial_investment * (1 + cagr) ** horizon
+
+# 2. Inflation adjustment — real purchasing-power value
+real_value = nominal_value / (1 + inflation_rate) ** horizon
+
+# 3. Sharpe-like score — return per unit of risk
+sharpe_score = cagr / volatility  if volatility > 0 else 0
+
+# 4. Risk-adjusted final value
+risk_adj_value = real_value * sharpe_score
+
+# 5. Ranking
+winner = max(summary, key=lambda k: summary[k]["risk_adj_value"])
+```
+
+**Data used by coder (from research nodes):**
+
+| Asset | CAGR  | Volatility |
+|-------|-------|------------|
+| VOO   | 13.5% | 15.0%      |
+| GLD   | 9.0%  | 16.0%      |
+| Bitcoin* | 45.0% | 60.0%   |
+
+> *NIFTY 500 researcher returned insufficient numeric data (NSE static page
+> did not expose CAGR/volatility figures). The coder defaulted to Bitcoin
+> from prior context — this is the bug fixed in subsequent runs by adding
+> Rule 6 to `coder.md`: *"Never invent, rename, or substitute items; if a
+> metric is missing, default to 0.0."*
+
+**Results (sandbox-verified):**
+
+| Asset   | Nominal ($)   | Real ($)      | Sharpe | Risk-Adj ($)    |
+|---------|---------------|---------------|--------|-----------------|
+| VOO     | 177,390       | 131,995       | 0.900  | 118,795         |
+| GLD     | 118,368       | 88,077        | 0.562  | 49,543          |
+| Bitcoin | 2,054,235     | 1,528,543     | 0.750  | **1,146,408**   |
+
+> Note: Bitcoin dominated purely due to its assumed 45% CAGR. The session
+> was re-run as **s8-a125f36e** with VOO / QQQ / GLD for clean, verifiable data.
+
+---
+
 ## Architecture — How the Growing Graph Works
 
 The Planner reads the user query and emits a small DAG of skill nodes.
