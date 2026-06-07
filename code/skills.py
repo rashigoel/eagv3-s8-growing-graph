@@ -714,6 +714,37 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
     if not parsed and raw_text.strip() and skill.tools_allowed:
         parsed = {"findings": raw_text.strip()[:10_000]}
 
+    # data_visualizer fallback: if the LLM returned empty/malformed output, build
+    # a minimal table+caption directly from the upstream sandbox stdout so the
+    # downstream formatter always has something to work with.
+    if skill.name == "data_visualizer" and not parsed.get("table"):
+        for r in resolved:
+            if r.get("kind") == "upstream" and isinstance(r.get("output"), dict):
+                stdout = r["output"].get("stdout", "")
+                if not stdout:
+                    continue
+                try:
+                    sb = json.loads(stdout)
+                    summary = sb.get("summary") or {}
+                    if summary:
+                        # Build a minimal markdown table from sandbox stdout
+                        metrics = list(next(iter(summary.values())).keys()) if summary else []
+                        header = "| Asset | " + " | ".join(metrics) + " |"
+                        sep = "|---|" + "---|" * len(metrics)
+                        rows = [
+                            "| " + name + " | " + " | ".join(str(v) for v in vals.values()) + " |"
+                            for name, vals in summary.items()
+                        ]
+                        parsed["table"] = "\n".join([header, sep] + rows)
+                        parsed["caption"] = sb.get("note", "")
+                        parsed["chart"] = ""
+                        parsed["data"] = {}
+                        print("[data_visualizer] WARNING: LLM returned empty output; "
+                              "synthesised table from sandbox stdout.")
+                except Exception:
+                    pass
+                break
+
     # Write an HTML Chart.js visualization whenever data_visualizer returns a table.
     # Falls back to parsing the markdown table when the LLM omits the `data` block.
     if skill.name == "data_visualizer" and parsed.get("table"):
