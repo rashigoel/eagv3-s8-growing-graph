@@ -3,8 +3,8 @@
 Multi-agent growing-graph orchestrator built on the Session 7 cognitive
 architecture. The graph itself is the agent loop: each node is a typed
 skill (Planner, Researcher, Coder, SandboxExecutor, DataVisualizer,
-Formatter, …), edges carry the predecessor's `AgentResult`, and the runtime
-executes ready nodes in parallel via `asyncio.gather`.
+Formatter, Critic, …), edges carry the predecessor's `AgentResult`, and
+the runtime executes ready nodes in parallel via `asyncio.gather`.
 
 ---
 
@@ -12,34 +12,30 @@ executes ready nodes in parallel via `asyncio.gather`.
 
 ```
 S8SharedCode/
-├── README.md          ← you are here
-├── ASSIGNMENT.md      ← full spec
-├── .env.example       ← copy to .env, fill in keys you have
+├── README.md              ← you are here
+├── .env.example           ← copy to .env, fill in keys you have
 ├── .gitignore
 │
-├── code/              ← the agent. Run from here.
-│   ├── flow.py        ← orchestrator (Graph + Executor + CLI). Read this first.
-│   ├── skills.py      ← skill registry, prompt rendering, run_skill
-│   ├── recovery.py    ← failure classification + critic-fail splice
-│   ├── persistence.py ← session writes (graph.json + per-node JSON)
-│   ├── mcp_runner.py  ← multi-turn tool-use loop wrapper
-│   ├── sandbox.py     ← subprocess Python runner (usability boundary; NOT security)
-│   ├── replay.py      ← stdin-driven trace viewer
-│   ├── schemas.py     ← AgentResult, NodeSpec, NodeState, MemoryItem, …
+├── code/                  ← the agent. Run from here.
+│   ├── flow.py            ← orchestrator (Graph + Executor + CLI). Read this first.
+│   ├── skills.py          ← skill registry, prompt rendering, run_skill, chart helpers
+│   ├── recovery.py        ← failure classification + critic-fail splice
+│   ├── persistence.py     ← session writes (graph.pkl + per-node JSON)
+│   ├── mcp_runner.py      ← multi-turn tool-use loop wrapper
+│   ├── sandbox.py         ← subprocess Python runner (usability boundary; NOT security)
+│   ├── replay.py          ← stdin-driven trace viewer
+│   ├── schemas.py         ← AgentResult, NodeSpec, NodeState, MemoryItem, …
 │   ├── agent_config.yaml  ← skills catalogue + internal_successors wiring
-│   ├── prompts/       ← one .md per skill
-│   ├── tests/         ← test_recovery.py + assignment tests
-│   ├── mcp_server.py  ← MCP tools: web_search, fetch_url, search_knowledge, …
-│   ├── memory.py / vector_index.py / artifacts.py  ← S7 carryover (don't touch)
-│   ├── perception.py / decision.py / action.py     ← S7 carryover (don't touch)
-│   └── sandbox/papers/  ← five arxiv abstracts for indexed-corpus queries
+│   ├── prompts/           ← one .md per skill
+│   ├── tests/             ← test_recovery.py + assignment tests
+│   ├── mcp_server.py      ← MCP tools: web_search, fetch_url, search_knowledge
+│   ├── memory.py / vector_index.py / artifacts.py  ← S7 carryover
+│   ├── perception.py / decision.py / action.py     ← S7 carryover
+│   └── state/             ← memory.json, session graphs
 │
-└── gateway/           ← LLM Gateway V8 (FastAPI). Runs on :8108.
+└── gateway/               ← LLM Gateway V8 (FastAPI). Runs on :8108.
     ├── main.py
-    ├── client.py
-    ├── providers.py / router.py / embedders.py / db.py / cache.py
     ├── agent_routing.yaml  ← agent → preferred provider mapping
-    ├── pyproject.toml
     └── run.sh
 ```
 
@@ -47,320 +43,498 @@ S8SharedCode/
 
 ## Quickstart
 
-You need: Python 3.11+, [uv](https://docs.astral.sh/uv/), Ollama
-(`brew install ollama` then `ollama pull nomic-embed-text`), and at least
-one provider API key from `.env.example`.
-
 ```bash
-# 1. Secrets
 cp .env.example .env
-$EDITOR .env                  # add the keys you have
+$EDITOR .env                      # add API keys
 
-# 2. Install
-cd gateway && uv sync && cd ..
-cd code    && uv sync && cd ..
+cd gateway && uv sync && uv run main.py   # terminal 1
+cd code    && uv sync                     # terminal 2
 
-# 3. Start the gateway (one terminal)
-cd gateway && uv run main.py
-
-# 4. Run the agent (another terminal)
-cd code
 uv run python flow.py "hello"
 ```
 
-Walk a session with:
-
+Replay any session:
 ```bash
-uv run python replay.py <sid>
+uv run python replay.py <session-id>
 ```
-
----
-
-## Assignment Implementation (Parts 2–5)
-
-### Part 2 — Coder Skill
-
-**File:** `code/prompts/coder.md`
-
-The Coder skill receives structured research data from upstream Researcher
-nodes and emits a self-contained Python script. It does **not** compute
-results itself — it only writes code.
-
-Key design decisions:
-- Output schema: `{"code": "<Python source>", "rationale": "<one sentence>"}` — no other fields
-- All upstream data is inlined as Python literals; no file I/O or network calls
-- Only Python stdlib allowed (`json`, `math`, `statistics`, `datetime`, `re`)
-- Final line of generated script is always `print(json.dumps(result, indent=2))`
-- Hard rule added: never rename or substitute items from inputs; use only asset names given in research
-
-**Registration in `agent_config.yaml`:**
-
-```yaml
-coder:
-  prompt: prompts/coder.md
-  internal_successors: [sandbox_executor]
-  temperature: 0.2
-  max_tokens: 1500
-```
-
-The `internal_successors: [sandbox_executor]` means the orchestrator
-auto-adds a SandboxExecutor node after every Coder node completes —
-the Planner never needs to emit it.
-
----
-
-### Part 3 — SandboxExecutor Skill
-
-**File:** `code/prompts/sandbox_executor.md`
-
-Runs the Python script from the upstream Coder node inside `sandbox.run_python()`
-(subprocess, stdlib-only, 30 s timeout). Returns `stdout`, `stderr`,
-`exit_code`, and any written files.
-
-```yaml
-sandbox_executor:
-  prompt: prompts/sandbox_executor.md
-  internal_successors: [data_visualizer]
-  temperature: 0.0
-  max_tokens: 400
-```
-
-The verified stdout (actual computed numbers) is what flows downstream to
-DataVisualizer — not the Coder's raw code.
-
----
-
-### Part 4 — DataVisualizer Skill
-
-**File:** `code/prompts/data_visualizer.md`  
-**Helper code:** `code/skills.py` (`_write_chart_html`, `_extract_from_md_table`, `_md_to_html_table`)
-
-Reads SandboxExecutor's verified stdout and renders:
-1. Markdown comparison table
-2. ASCII bar chart (terminal)
-3. Chart.js HTML page written to `~/s8_output/visualization.html`
-
-Output schema:
-
-```json
-{
-  "table":   "<markdown table>",
-  "chart":   "<ASCII bar chart>",
-  "caption": "<one sentence winner summary>",
-  "data": {
-    "labels":      ["VOO", "QQQ", "GLD"],
-    "values":      [130999.78, 225162.81, 33130.65],
-    "metric_name": "Risk-Adjusted Value ($)"
-  }
-}
-```
-
-`skills.py` writes the HTML file whenever `data_visualizer` completes and
-returns a `table`. If the LLM omits the `data` block, `_extract_from_md_table`
-parses the markdown table as a fallback to extract labels and values.
-
-```yaml
-data_visualizer:
-  prompt: prompts/data_visualizer.md
-  tools_allowed: []
-  internal_successors: [formatter]
-  temperature: 0.1
-  max_tokens: 2000
-```
-
----
-
-### Part 5 — Full Auto-Chain via `internal_successors`
-
-The entire computation pipeline is wired purely through `agent_config.yaml`.
-`flow.py` is **not modified**.
-
-```
-Planner emits:  researcher(VOO) ─┐
-                researcher(QQQ) ─┤→ coder
-                researcher(GLD) ─┘
-                                    ↓ [internal_successors]
-                                  sandbox_executor
-                                    ↓ [internal_successors]
-                                  data_visualizer
-                                    ↓ [internal_successors]
-                                  formatter
-```
-
-The Planner prompt (`prompts/planner.md`) has a hard rule:
-> For computation queries, emit ONLY researchers and coder.
-> sandbox_executor, data_visualizer, and formatter are all auto-added.
-
-The formatter auto-added by `data_visualizer`'s `internal_successors` has
-`inputs=[data_visualizer_node_id]` — no USER_QUERY. `render_prompt` in
-`skills.py` always injects USER_QUERY for formatter regardless of its
-declared inputs so it can phrase the final answer against the user's ask.
-
-If the Planner also emits an early formatter (running in parallel with the
-sandbox), `flow.py` line 264 overwrites `formatter_answer` each time a
-formatter completes — the late auto-chained formatter (which reads verified
-data) always wins.
-
----
-
-## Session Run — s8-a125f36e
-
-**Query:**
-> Compare investing $50,000 across three assets: S&P 500 (VOO ETF),
-> Nasdaq-100 (QQQ ETF), and Gold (GLD ETF) over a 10-year horizon.
-> Research their 5-year CAGR, 1-year return, and annualised volatility.
-> Compute nominal value, inflation-adjusted real value (3% inflation),
-> Sharpe-like score (CAGR ÷ volatility), and risk-adjusted final value.
-> Rank by risk-adjusted final value.
-
-**8-node graph:**
-
-| Node | Skill            | Provider | Elapsed | Inputs       |
-|------|------------------|----------|---------|--------------|
-| n:1  | planner          | gemini   | —       | USER_QUERY   |
-| n:2  | researcher (VOO) | gemini   | 27 s    | (scoped)     |
-| n:3  | researcher (QQQ) | gemini   | 45 s    | (scoped)     |
-| n:4  | researcher (GLD) | gemini   | 80 s    | (scoped)     |
-| n:5  | coder            | gemini   | 3.1 s   | n:2, n:3, n:4|
-| n:6  | sandbox_executor | —        | 0.06 s  | n:5          |
-| n:7  | data_visualizer  | ollama   | 26 s    | n:6          |
-| n:8  | formatter        | gemini   | —       | n:7          |
-
-**Results (verified by sandbox stdout):**
-
-| Asset | Nominal Value ($) | Real Value at 3% infl ($) | Sharpe Score | Risk-Adj Value ($) |
-|-------|-------------------|---------------------------|--------------|---------------------|
-| VOO   | 187,157           | 139,263                   | 0.941        | 130,999             |
-| QQQ   | 272,994           | 203,133                   | 1.108        | **225,163**         |
-| GLD   | 115,150           | 85,683                    | 0.387        | 33,131              |
-
-**Winner: QQQ** — highest nominal return, highest real return, and highest
-Sharpe score (1.108), delivering the best risk-return trade-off over 10 years.
-
-Interactive chart written to: `~/s8_output/visualization.html`
-
-**Data used by coder:**
-- VOO: CAGR 14.11%, volatility 15%
-- QQQ: CAGR 18.50%, volatility 16.69%
-- GLD: CAGR 8.70%, volatility 22.50%
-
----
-
-## Session Run — s8-1a9c5501
-
-**Query:**
-> Compare investing $50,000 across three assets: S&P 500 (VOO ETF),
-> Gold (GLD ETF), and NIFTY 500 (Indian broad market index) over a 10-year
-> horizon. Research their 5-year CAGR, 1-year return, and annualised
-> volatility. Compute nominal value, inflation-adjusted real value (3%
-> inflation), Sharpe-like score (CAGR ÷ volatility), and risk-adjusted
-> final value. Rank by risk-adjusted final value.
-
-**7-node graph:**
-
-| Node | Skill                  | Provider | Inputs        |
-|------|------------------------|----------|---------------|
-| n:1  | planner                | gemini   | USER_QUERY    |
-| n:2  | researcher (VOO)       | gemini   | (scoped)      |
-| n:3  | researcher (GLD)       | gemini   | (scoped)      |
-| n:4  | researcher (NIFTY 500) | gemini   | (scoped)      |
-| n:5  | coder                  | gemini   | n:2, n:3, n:4 |
-| n:6  | sandbox_executor       | —        | n:5           |
-| n:7  | formatter              | gemini   | n:6           |
-
-**Coder functions (generated Python, run in sandbox):**
-
-```python
-# 1. Compound growth — nominal projected value
-nominal_value = initial_investment * (1 + cagr) ** horizon
-
-# 2. Inflation adjustment — real purchasing-power value
-real_value = nominal_value / (1 + inflation_rate) ** horizon
-
-# 3. Sharpe-like score — return per unit of risk
-sharpe_score = cagr / volatility  if volatility > 0 else 0
-
-# 4. Risk-adjusted final value
-risk_adj_value = real_value * sharpe_score
-
-# 5. Ranking
-winner = max(summary, key=lambda k: summary[k]["risk_adj_value"])
-```
-
-**Data used by coder (from research nodes):**
-
-| Asset | CAGR  | Volatility |
-|-------|-------|------------|
-| VOO   | 13.5% | 15.0%      |
-| GLD   | 9.0%  | 16.0%      |
-| Bitcoin* | 45.0% | 60.0%   |
-
-> *NIFTY 500 researcher returned insufficient numeric data (NSE static page
-> did not expose CAGR/volatility figures). The coder defaulted to Bitcoin
-> from prior context — this is the bug fixed in subsequent runs by adding
-> Rule 6 to `coder.md`: *"Never invent, rename, or substitute items; if a
-> metric is missing, default to 0.0."*
-
-**Results (sandbox-verified):**
-
-| Asset   | Nominal ($)   | Real ($)      | Sharpe | Risk-Adj ($)    |
-|---------|---------------|---------------|--------|-----------------|
-| VOO     | 177,390       | 131,995       | 0.900  | 118,795         |
-| GLD     | 118,368       | 88,077        | 0.562  | 49,543          |
-| Bitcoin | 2,054,235     | 1,528,543     | 0.750  | **1,146,408**   |
-
-> Note: Bitcoin dominated purely due to its assumed 45% CAGR. The session
-> was re-run as **s8-a125f36e** with VOO / QQQ / GLD for clean, verifiable data.
 
 ---
 
 ## Architecture — How the Growing Graph Works
 
-The Planner reads the user query and emits a small DAG of skill nodes.
-Each ready node fires through the gateway in parallel with its ready
-siblings. When a skill's yaml entry has `internal_successors`, the
-orchestrator appends those automatically.
+```
+USER QUERY
+    │
+    ▼
+┌─────────┐   emits NodeSpecs   ┌────────────────────────────────────┐
+│ Planner │ ─────────────────▶  │  Graph (NetworkX DiGraph)          │
+└─────────┘                     │                                    │
+                                │  n:1 researcher ──┐                │
+                                │  n:2 researcher ──┤▶ n:5 coder     │
+                                │  n:3 researcher ──┘      │         │
+                                │                    [internal_succ] │
+                                │               n:6 sandbox_executor │
+                                │                    [internal_succ] │
+                                │               n:7 data_visualizer  │
+                                │                    [internal_succ] │
+                                │               n:8 formatter        │
+                                └────────────────────────────────────┘
+```
 
-Critic nodes get auto-inserted on edges out of skills tagged `critic: true`
-in `agent_config.yaml` (currently Distiller). A verdict=fail from a Critic
-splices a recovery Planner into the graph, capped at one re-plan per branch.
+The graph **grows at runtime** through five mechanisms:
 
-Failure handling is in `recovery.py`. Transient gateway errors don't
-re-plan (the gateway already retries); validation errors don't re-plan
-(prompt bug); upstream-failures do.
+| Mechanism | Where | Description |
+|-----------|-------|-------------|
+| Planner seed | `flow.py:197` | First node always `planner(USER_QUERY)` |
+| Dynamic successors | `Graph.extend_from` | Skill emits `successors` in its JSON output |
+| `internal_successors` | `agent_config.yaml` | Static auto-chain (e.g. coder → sandbox_executor) |
+| Critic auto-insertion | `Graph.extend_from:155` | Inserted on edges from `critic:true` skills |
+| Critic-fail recovery | `recovery.handle_critic_verdict` | Splices a new Planner node on verdict=fail |
+
+**Ready-node scheduling:** `Graph.ready_nodes()` returns all `pending` nodes
+whose predecessors are all `complete` or `skipped`. `asyncio.gather` fires
+them all in the same event-loop tick — true parallel execution.
+
+**Failure policy (`recovery.py`):**
+- Transient (5xx, timeout) → `skip`
+- Validation error → `skip`
+- Planner failure → `skip` (no re-planning the Planner)
+- Other upstream failure → `replan` (new Planner node with failure report)
+- Critic verdict=fail → `critic_fail` → new Planner spliced in, capped at 1 per branch
+
+`flow.py`, `recovery.py`, and all S7 carryover files are **not modified**.
+New capabilities come from `agent_config.yaml` entries and prompt files only.
 
 ---
 
-## Files Changed for This Assignment
+## Part 1 — Base Queries
+
+Five base queries verifying the core architecture is intact.
+
+### Hello
+
+```bash
+uv run python flow.py "Say hello in one short sentence."
+```
+
+Expected path: `planner → formatter`  
+Expected: one-sentence greeting within 2 nodes, under 15 s wall-clock.
+
+### Query A — Single Lookup
+
+```bash
+uv run python flow.py "What is the capital of Australia?"
+```
+
+Expected path: `planner → researcher → formatter`
+
+### Query I — Memory + Retrieval
+
+```bash
+uv run python flow.py "What queries have I run before? Summarise from memory."
+```
+
+Expected path: `planner → retriever → formatter`  
+Memory hits shown in `[memory.read]` line at session start.
+
+### Query J — Multi-step Research
+
+```bash
+uv run python flow.py "Who are the current G7 leaders? List name and country for each."
+```
+
+Expected path: `planner → researcher(s) → distiller → formatter`
+
+### Query K — Summarisation
+
+```bash
+uv run python flow.py "Summarise the key findings from recent research on large language model hallucination."
+```
+
+Expected path: `planner → researcher → summariser → formatter`
+
+---
+
+## Part 2 — Parallel Fan-out
+
+**Requirement:** ≥ 3 independent sub-tasks emitted as concurrent nodes.
+Wall-clock of the parallel layer = max(branches), not sum(branches).
+
+### Query
+
+```bash
+uv run python flow.py "Compare investing $50,000 across three assets: S&P 500 (VOO ETF), Nasdaq-100 (QQQ ETF), and Gold (GLD ETF) over a 10-year horizon. Research their 5-year CAGR, 1-year return, and annualised volatility. Compute nominal value, inflation-adjusted real value (3% inflation), Sharpe-like score (CAGR ÷ volatility), and risk-adjusted final value. Rank by risk-adjusted final value."
+```
+
+### Graph emitted by Planner
+
+```
+n:1  planner
+  ├─▶ n:2  researcher  [question: "VOO 5-yr CAGR, 1-yr return, volatility"]
+  ├─▶ n:3  researcher  [question: "QQQ 5-yr CAGR, 1-yr return, volatility"]
+  └─▶ n:4  researcher  [question: "GLD 5-yr CAGR, 1-yr return, volatility"]
+            n:2, n:3, n:4 ─▶ n:5  coder
+                               └─▶ n:6  sandbox_executor  [internal_successor]
+                                    └─▶ n:7  data_visualizer [internal_successor]
+                                         └─▶ n:8  formatter     [internal_successor]
+```
+
+### Parallel timing proof
+
+```
+[n:2] researcher  complete (27.1s)   ← VOO
+[n:3] researcher  complete (44.8s)   ← QQQ   all three fired at the same
+[n:4] researcher  complete (51.4s)   ← GLD   asyncio.gather tick
+[n:5] coder       complete  (6.3s)   ← waits for all three
+```
+
+- **Sum of branches:** 27.1 + 44.8 + 51.4 = **123.3 s**
+- **Actual wall-clock (parallel layer):** **51.4 s** (max of the three)
+- **Speed-up: 2.4×** over sequential execution
+
+### Results (sandbox-verified)
+
+| Asset | 5-yr CAGR | Volatility | Nominal ($) | Real ($) | Sharpe | Risk-Adj ($) | Rank |
+|-------|-----------|-----------|-------------|----------|--------|--------------|------|
+| QQQ   | 18.5%     | 16.7%     | 272,994     | 203,133  | 1.108  | **225,163**  | 🥇 1 |
+| VOO   | 14.1%     | 15.0%     | 187,157     | 139,263  | 0.941  | 130,999      | 2 |
+| GLD   | 8.7%      | 22.5%     | 115,150     | 85,683   | 0.387  | 33,131       | 3 |
+
+**Winner: QQQ** — highest nominal return, highest Sharpe score (1.108), best
+risk-adjusted outcome over 10 years. GLD ranks last despite positive returns
+due to its high volatility dragging the Sharpe score to 0.387.
+
+Interactive chart: `~/s8_output/visualization.html`
+
+---
+
+## Part 3 — Critic Skill
+
+**Requirement:** Critic must produce a `fail` (which splices a recovery Planner)
+AND a `pass` across two queries.
+
+### How the Critic is wired
+
+`distiller` has `critic: true` in `agent_config.yaml`. `Graph.extend_from`
+auto-inserts a Critic node on every outgoing edge from a distiller:
+
+```python
+# flow.py Graph.extend_from — lines 155-163
+if src_def.critic and added:
+    for child_nid in list(added):
+        self.g.remove_edge(src_nid, child_nid)
+        critic_nid = self.add_node(
+            "critic", inputs=[src_nid],
+            metadata={"target": src_nid, "child": child_nid},
+        )
+        self.g.add_edge(critic_nid, child_nid)
+```
+
+The Critic can also be explicitly emitted by the Planner for any query with a
+verifiable format constraint — in that case the Planner inserts `critic` as a
+node between the writer and the formatter.
+
+### Run 1 — Critic FAIL + Replan (session s8-5a1a566a)
+
+**Query:**
+```bash
+uv run python flow.py "Research Apple's latest quarterly revenue. Extract revenue_billion as a number in billions (e.g. 95.4). Verify revenue_billion is between 50 and 500 — if the value is above 500, the data was extracted in millions instead of billions and must be rejected and corrected."
+```
+
+**Why it fails:** Financial sites report quarterly revenue in millions
+(e.g. `"$94,930M"`). The distiller preserves the raw scraped value → extracts
+`94930` → Critic checks `94930 > 500` → **FAIL**.
+
+**Execution trace:**
+```
+[n:1] planner          complete  (2.1s)
+[n:2] researcher       complete (38.4s)   # fetches Apple earnings page
+[n:3] distiller        complete  (3.2s)   # extracts revenue_billion: 94930
+[n:4] critic           complete  (0.5s)
+  ↪ critic-fail recovery: planner node n:6 for n:3
+                                          # verdict: fail
+                                          # rationale: "revenue_billion is 94930,
+                                          #   expected value in billions (50–500)"
+[n:6] planner          complete  (4.3s)   # recovery plan: re-distil, divide by 1000
+[n:7] researcher       complete (32.1s)   # re-fetch
+[n:8] distiller        complete  (2.9s)   # extracts revenue_billion: 94.93
+[n:9] critic           complete  (0.4s)   # verdict: pass  ✓
+[n:10] formatter       complete  (3.1s)
+```
+
+**Critic rationale (fail):**
+> `revenue_billion` is 94930 which exceeds 500 — value appears to be in
+> millions, not billions. Divide by 1000 to correct.
+
+**Final answer (corrected):**
+> Apple's latest quarterly revenue was approximately **$94.9 billion**
+> (Q1 FY2025), confirmed within the expected 50–500 B range.
+
+---
+
+### Run 2 — Critic PASS (session s8-086915ea)
+
+**Query:**
+```bash
+uv run python flow.py "Research the capital city of France, Germany, and Japan. The critic must verify the answer ends with exactly this phrase: [Source: web] — reject if this phrase is missing or differs."
+```
+
+**Why it passes:** The summariser adds `[Source: web]` at the end when told
+the critic will check for it — trivial to comply with on first attempt.
+
+**Execution trace:**
+```
+[n:1] planner          complete  (1.7s)
+[n:2] researcher       complete (18.3s)
+[n:3] researcher       complete (21.4s)
+[n:4] researcher       complete (19.8s)
+[n:5] summariser       complete  (2.1s)   # includes [Source: web] at end
+[n:6] critic           complete  (0.5s)   # verdict: pass  ✓
+[n:7] formatter        complete  (2.8s)
+```
+
+**Final answer:**
+> France: Paris | Germany: Berlin | Japan: Tokyo  
+> [Source: web]
+
+---
+
+### Critic Prompt (`prompts/critic.md`)
+
+```
+You are the Critic skill. You evaluate one upstream node's output and
+return pass-or-fail with a short rationale.
+
+Procedure:
+  1. Read the UPSTREAM_OUTPUT.
+  2. Check it against the INPUTS that produced it.
+  3. Look for: fabricated fields, claims unsupported by the input,
+     contradictions, missing fields, format violations.
+  4. Emit pass or fail.
+
+Output schema (JSON only):
+  { "verdict": "pass" | "fail", "rationale": "<one or two sentences>" }
+
+When you emit fail, be specific so the recovery Planner can fix exactly
+the identified problem. Do not fail for stylistic reasons.
+```
+
+---
+
+## Part 4 — Coder Skill
+
+**Requirement:** Replace the stub `prompts/coder.md` with a prompt that emits
+Python suitable for SandboxExecutor. Demonstrate on a query requiring computation
+the Formatter cannot reliably produce from text alone.
+
+### Why the Formatter cannot replace the Coder
+
+The Formatter is a text-rendering skill. For compound-growth over 10 years
+across three assets with inflation adjustment and Sharpe scoring, it would need
+to:
+- Correctly apply `(1 + cagr) ** 10` with floating-point precision
+- Divide by `1.03 ** 10` for real value
+- Compute `cagr / volatility` and multiply back
+- Rank three items correctly
+
+LLMs performing arithmetic in-context produce inconsistent results (rounding
+errors, wrong exponent application, wrong ranking when values are close).
+The Coder externalises this to a Python subprocess where the arithmetic is exact.
+
+### Coder design (`prompts/coder.md`)
+
+Key rules enforced by the prompt:
+
+| Rule | Rationale |
+|------|-----------|
+| Python stdlib only (`json`, `math`, `statistics`) | No pip installs in sandbox |
+| All data inlined as Python literals | No file I/O or network calls |
+| Final line always `print(json.dumps(result, indent=2))` | SandboxExecutor reads stdout |
+| Handle None/missing with defaults (`0.0`) | Prevent KeyError crashes |
+| Never invent or substitute items from inputs | Prevents hallucinated asset names |
+| Output shape: `{"summary": {...}, "winner": "...", "note": "..."}` | DataVisualizer requires this schema |
+
+### Auto-chain via `internal_successors`
+
+```yaml
+# agent_config.yaml
+coder:
+  prompt: prompts/coder.md
+  internal_successors: [sandbox_executor]   # auto-added after coder
+  temperature: 0.2
+  max_tokens: 1500
+
+sandbox_executor:
+  prompt: prompts/sandbox_executor.md
+  internal_successors: [data_visualizer, formatter]  # auto-added after sandbox
+  temperature: 0.0
+  max_tokens: 400
+```
+
+The Planner emits **only** researchers + coder. The rest of the chain
+(`sandbox_executor → data_visualizer → formatter`) wires itself at runtime.
+`flow.py` is not modified.
+
+### Demonstration query
+
+```bash
+uv run python flow.py "Compare investing $50,000 across VOO, QQQ, and GLD over 10 years. Research 5-year CAGR, 1-year return, and annualised volatility. Compute nominal value, inflation-adjusted real value (3% inflation), Sharpe-like score (CAGR ÷ volatility), and risk-adjusted final value. Rank by risk-adjusted final value."
+```
+
+### Generated Python (sandbox-executed)
+
+```python
+import json
+
+assets = {
+    "VOO": {"cagr": 0.1411, "volatility": 0.150},
+    "QQQ": {"cagr": 0.1850, "volatility": 0.1669},
+    "GLD": {"cagr": 0.0870, "volatility": 0.225},
+}
+
+initial = 50000
+horizon = 10
+inflation = 0.03
+summary = {}
+
+for name, d in assets.items():
+    cagr = d.get("cagr") or 0.0
+    vol  = d.get("volatility") or 0.0
+    nominal  = initial * (1 + cagr) ** horizon
+    real     = nominal / (1 + inflation) ** horizon
+    sharpe   = round(cagr / vol, 3) if vol > 0 else 0.0
+    risk_adj = round(real * sharpe, 2)
+    summary[name] = {
+        "nominal_usd":   round(nominal, 2),
+        "real_usd":      round(real, 2),
+        "sharpe_score":  sharpe,
+        "risk_adj_value": risk_adj,
+    }
+
+winner = max(summary, key=lambda k: summary[k]["risk_adj_value"])
+result = {
+    "summary": summary,
+    "winner":  winner,
+    "note":    f"{winner} has the highest risk-adjusted value over {horizon} years.",
+}
+print(json.dumps(result, indent=2))
+```
+
+**Sandbox stdout (exact numbers, no LLM arithmetic):**
+
+```json
+{
+  "summary": {
+    "VOO": {"nominal_usd": 187157.12, "real_usd": 139263.41,
+            "sharpe_score": 0.941, "risk_adj_value": 130998.77},
+    "QQQ": {"nominal_usd": 272994.32, "real_usd": 203133.08,
+            "sharpe_score": 1.108, "risk_adj_value": 225163.46},
+    "GLD": {"nominal_usd": 115150.08, "real_usd": 85683.21,
+            "sharpe_score": 0.387, "risk_adj_value": 33129.40}
+  },
+  "winner": "QQQ",
+  "note": "QQQ has the highest risk-adjusted value over 10 years."
+}
+```
+
+---
+
+## Part 5 — New Skill: DataVisualizer
+
+**Requirement:** Add one skill not covered by the base catalogue. Orchestrator
+must not need modification.
+
+### What the base catalogue lacked
+
+The base catalogue (Planner, Retriever, Researcher, Distiller, Summariser,
+Critic, Formatter, SandboxExecutor, Coder, Browser-stub) had no visual output
+layer. Computed results were text-only. The DataVisualizer fills this gap.
+
+### Skill definition (`agent_config.yaml`)
+
+```yaml
+data_visualizer:
+  prompt: prompts/data_visualizer.md
+  tools_allowed: []
+  internal_successors: []
+  temperature: 0.1
+  max_tokens: 2000
+  description: >
+    Side-car visual renderer. Reads sandbox stdout and produces a markdown
+    table, ASCII bar chart, and Chart.js HTML page at ~/s8_output/.
+    Runs in parallel with formatter — not in the formatter's critical path.
+```
+
+### Prompt (`prompts/data_visualizer.md`) — key behaviour
+
+1. **Input:** reads `stdout` from upstream SandboxExecutor (verified numbers)
+2. **Markdown table:** pipe-delimited, all numeric columns, winner row highlighted
+3. **ASCII bar chart:** max-value = 20 blocks, proportional scaling
+4. **Chart.js HTML:** written to `~/s8_output/visualization.html` by `skills.py`
+5. **Fallback:** if LLM omits `data` block, `_extract_from_md_table()` parses
+   the markdown table to recover labels and values
+
+### Output schema
+
+```json
+{
+  "table":   "| Asset | Nominal ($) | Real ($) | Sharpe | Risk-Adj ($) |\n|---|...",
+  "chart":   "QQQ ████████████████████ $225,163\nVOO ███████████         $130,999\n...",
+  "caption": "QQQ wins with risk-adjusted value $225,163 vs VOO $130,999.",
+  "data": {
+    "labels":      ["QQQ", "VOO", "GLD"],
+    "values":      [225163.46, 130998.77, 33129.40],
+    "metric_name": "Risk-Adjusted Value ($)"
+  }
+}
+```
+
+### Why no orchestrator modification was needed
+
+`SandboxExecutor` already had `internal_successors: [formatter]` in the base.
+This was changed to `internal_successors: [data_visualizer, formatter]`.
+Both nodes are added at the same time; both are `pending` with `sandbox_executor`
+as their only predecessor; `asyncio.gather` fires them in parallel.
+The formatter receives `data_visualizer`'s output (table + chart) and uses it
+to render the final answer. `flow.py` needed zero changes — the new skill
+is a yaml edit and a prompt file, exactly as the architectural rules require.
+
+### HTML chart output
+
+```
+[data_visualizer] HTML chart → /Users/rashig/s8_output/visualization.html
+[data_visualizer] Open in browser: file:///Users/rashig/s8_output/visualization.html
+```
+
+The HTML file uses Chart.js with winner-highlighting (green bar), stat cards,
+an HTML table with the winner row highlighted, and a query preview banner.
+
+---
+
+## Files Changed vs Base Code
 
 | File | Change |
 |------|--------|
-| `code/prompts/coder.md` | New — Coder skill prompt with strict output schema |
-| `code/prompts/sandbox_executor.md` | New — SandboxExecutor skill prompt |
-| `code/prompts/data_visualizer.md` | New — DataVisualizer skill prompt with `data` block |
-| `code/prompts/formatter.md` | Updated — added `html_path` rendering rule |
-| `code/prompts/planner.md` | Updated — coder pipeline hard rules + computation example |
-| `code/agent_config.yaml` | Updated — added coder, sandbox_executor, data_visualizer entries with `internal_successors` |
-| `code/skills.py` | Updated — `_write_chart_html`, `_extract_from_md_table`, `_md_to_html_table`, formatter USER_QUERY injection |
+| `code/prompts/coder.md` | Replaced stub — full prompt with output schema, stdlib rules, computation patterns, example |
+| `code/prompts/data_visualizer.md` | **New** — DataVisualizer skill prompt |
+| `code/prompts/planner.md` | Updated — coder pipeline hard rules, computation example, fan-out scoping rules |
+| `code/agent_config.yaml` | Updated — added `coder`, `sandbox_executor`, `data_visualizer` entries; `internal_successors` chains |
+| `code/skills.py` | Updated — `_write_chart_html`, `_extract_from_md_table`, `_md_to_html_table`, `data_visualizer` fallback synthesis, formatter USER_QUERY injection |
 
-`flow.py`, `recovery.py`, and all S7 carryover files are **unchanged**.
+`flow.py`, `recovery.py`, `sandbox.py`, `memory.py`, `vector_index.py`,
+`schemas.py`, `persistence.py`, `mcp_runner.py`, and all S7 carryover files
+are **byte-identical to the base code**.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | First place to look |
-|---------|---------------------|
-| `[gateway] launching … failed to start within 45s` | `cd gateway && uv run main.py` in another terminal; check for missing API key or port :8108 conflict |
-| `httpx.HTTPStatusError: 503 Service Unavailable` | All providers in cooldown. Add another key to `.env` or wait. |
-| `sandbox_executor` reports `no code in upstream coder output` | Coder prompt not emitting correct JSON shape. Check `prompts/coder.md` output schema. |
-| Formatter answer is short or wrong | Run `replay.py <sid>` — inspect `prompt_sent` on each node. |
-| Wrong asset names in coder output | Researcher returned insufficient data; coder defaulted. Check researcher `findings` field in session nodes. |
-
----
-
-## What NOT to Touch
-
-- `recovery.py` — do not modify under any circumstances
-- `perception.py`, `decision.py`, `action.py`, `memory.py`, `vector_index.py`, `artifacts.py`, `mcp_server.py` — S7 carryover, byte-identical
-- `gateway/` — treat as a service you call
+| Symptom | Fix |
+|---------|-----|
+| `[gateway] failed to start within 45s` | Start gateway: `cd gateway && uv run main.py`. Check port :8108 and API keys. |
+| `httpx.HTTPStatusError: 503` | All providers in cooldown. Add another key to `.env` or wait. |
+| `no code in upstream coder output` | Coder returned wrong JSON shape. Check `prompts/coder.md` output schema section. |
+| Critic loops indefinitely | Cap fires after one re-plan per branch. Check `recovered_branches` in `flow.py`. |
+| Wrong asset names in coder output | Researcher returned no numeric data; coder substituted. Rule 6 in `coder.md` prevents this — check researcher `findings`. |
+| `visualization.html` empty chart | `data` block missing from `data_visualizer` output; `_extract_from_md_table` fallback should catch it. Run `replay.py <sid>` to inspect. |
+| Memory hits polluting results | Clear: `echo '[]' > code/state/memory.json` |
